@@ -17,7 +17,7 @@ from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
 
 
 def modulate(x, shift, scale):
-    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)        # x * (1+scale) + shift
 
 
 #################################################################################
@@ -48,18 +48,18 @@ class TimestepEmbedder(nn.Module):
         :return: an (N, D) Tensor of positional embeddings.
         """
         # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
-        half = dim // 2
+        half = dim // 2                                                            # 维度的一半
         freqs = torch.exp(
-            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
-        ).to(device=t.device)
-        args = t[:, None].float() * freqs[None]
-        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-        if dim % 2:
+            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half     # -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32)为exponent
+        ).to(device=t.device)                                                      # 频率
+        args = t[:, None].float() * freqs[None]                                    # 参数
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)          # 连接
+        if dim % 2:                                             # 假如不能被2整除，则在向量后面补零
             embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
         return embedding
 
     def forward(self, t):
-        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)      # 这一个是
         t_emb = self.mlp(t_freq)
         return t_emb
 
@@ -116,7 +116,8 @@ class DiTBlock(nn.Module):
         )
 
     def forward(self, x, c):
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
+        # 对应图中，shift_msa-->beta1, scale_msa-->gama1, gate_msa-->aphla1, shift_mlp-->beta2, scale_mlp-->gama2, gate_mlp-->aphla2
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)     # 本质来讲就是MLP层
         x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
@@ -128,21 +129,21 @@ class FinalLayer(nn.Module):
     """
     def __init__(self, hidden_size, patch_size, out_channels):
         super().__init__()
-        self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
+        self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)     # ln正则
+        self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)     # 线性层
         self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_size, 2 * hidden_size, bias=True)
+            nn.SiLU(),                                                  # 本质来讲就是加权版的sigmoid
+            nn.Linear(hidden_size, 2 * hidden_size, bias=True)          # 这一步主要是为了后续的拆分成shift和scale进行拟合
         )
 
     def forward(self, x, c):
-        shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
-        x = modulate(self.norm_final(x), shift, scale)
+        shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)     # MLP，shift和scale对应的gama和beta
+        x = modulate(self.norm_final(x), shift, scale)              #
         x = self.linear(x)
         return x
 
 
-class DiT(nn.Module):
+class DiT(nn.Module):                       # DiT网络
     """
     Diffusion model with a Transformer backbone.
     """
@@ -160,22 +161,27 @@ class DiT(nn.Module):
         learn_sigma=True,
     ):
         super().__init__()
-        self.learn_sigma = learn_sigma
-        self.in_channels = in_channels
-        self.out_channels = in_channels * 2 if learn_sigma else in_channels
+        self.learn_sigma = learn_sigma                  # 学习sigma
+        self.in_channels = in_channels                  # latent的通道
+        self.out_channels = in_channels * 2 if learn_sigma else in_channels     # 输出的通道
         self.patch_size = patch_size
         self.num_heads = num_heads
 
-        self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
-        self.t_embedder = TimestepEmbedder(hidden_size)
-        self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
+        # patchembed本质来讲就是将图片分成多个区域来进行编码
+        self.x_embedder = PatchEmbed(input_size,        # 图像尺寸
+                                     patch_size,        # 每个patch的大小，并非将图片划为patch_size个patch
+                                     in_channels,       # 输入的通道数，彩色图像通常为3
+                                     hidden_size,       # 将每个patch编码为embed_dim维向量
+                                     bias=True)
+        self.t_embedder = TimestepEmbedder(hidden_size)                 # 时间位置编码
+        self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)       # 对应emb_lookup
         num_patches = self.x_embedder.num_patches
         # Will use fixed sin-cos embedding:
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)    # 正向embedding，本质来讲就是全是1的embedding
 
         self.blocks = nn.ModuleList([
             DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
-        ])
+        ])                                          # DiTBlock
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
         self.initialize_weights()
 
@@ -220,14 +226,14 @@ class DiT(nn.Module):
         x: (N, T, patch_size**2 * C)
         imgs: (N, H, W, C)
         """
-        c = self.out_channels
-        p = self.x_embedder.patch_size[0]
+        c = self.out_channels                       # 输出的通道数
+        p = self.x_embedder.patch_size[0]           #
         h = w = int(x.shape[1] ** 0.5)
-        assert h * w == x.shape[1]
+        assert h * w == x.shape[1]                  # 判断不等于之前的形状
 
-        x = x.reshape(shape=(x.shape[0], h, w, p, p, c))
+        x = x.reshape(shape=(x.shape[0], h, w, p, p, c))                #
         x = torch.einsum('nhwpqc->nchpwq', x)
-        imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
+        imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))           # 转成和latent noise一样的维度
         return imgs
 
     def forward(self, x, t, y):
@@ -237,14 +243,14 @@ class DiT(nn.Module):
         t: (N,) tensor of diffusion timesteps
         y: (N,) tensor of class labels
         """
-        x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
+        x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2     x_embedder本质来讲是一个patch
         t = self.t_embedder(t)                   # (N, D)
-        y = self.y_embedder(y, self.training)    # (N, D)
+        y = self.y_embedder(y, self.training)    # (N, D)   lable embedding
         c = t + y                                # (N, D)
         for block in self.blocks:
             x = block(x, c)                      # (N, T, D)
         x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
-        x = self.unpatchify(x)                   # (N, out_channels, H, W)
+        x = self.unpatchify(x)                   # (N, out_channels, H, W)    Layer and reshape
         return x
 
     def forward_with_cfg(self, x, t, y, cfg_scale):
@@ -362,7 +368,7 @@ def DiT_S_8(**kwargs):
     return DiT(depth=12, hidden_size=384, patch_size=8, num_heads=6, **kwargs)
 
 
-DiT_models = {
+DiT_models = {                                                  # 这个是模型
     'DiT-XL/2': DiT_XL_2,  'DiT-XL/4': DiT_XL_4,  'DiT-XL/8': DiT_XL_8,
     'DiT-L/2':  DiT_L_2,   'DiT-L/4':  DiT_L_4,   'DiT-L/8':  DiT_L_8,
     'DiT-B/2':  DiT_B_2,   'DiT-B/4':  DiT_B_4,   'DiT-B/8':  DiT_B_8,
